@@ -58,8 +58,7 @@
     width: 800px;
     margin: 0 auto;
     position: relative;
-    background: url('ajax-loader.gif') center center no-repeat;
-
+    /*background: url('ajax-loader.gif') center center no-repeat;*/
 }
 
 #viewer.scrolled .epub-container {
@@ -71,6 +70,13 @@
 
 #viewer.scrolled .epub-view > iframe {
     background: white;
+}
+
+@font-face {
+    font-family: 'Material Icons';
+    font-style: normal;
+    font-weight: 400;
+    src: url(/static/fonts/flUhRq6tzZclQEJ-Vdg-IuiaDsNc.woff2) format('woff2');
 }
 
 #prev {
@@ -309,4 +315,25 @@ input:-webkit-autofill , textarea:-webkit-autofill, select:-webkit-autofill {
 
 input {
     background-color:transparent;
+}
+
+.md-content {
+    border-radius: 10px!important;
+}
+
+.br {
+    border-radius: 10px!important;
+}
+.playlist-active{
+    background-color: #cfd2e1
+}
+.mdui-theme-layout-dark {
+    color: #fff;
+    background-color: #424242;
+}
+@media (prefers-color-scheme: dark) {
+    .mdui-theme-layout-auto {
+        color: #fff;
+        background-color: #424242;
+    }
 }
