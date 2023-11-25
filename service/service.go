@@ -1,561 +1,1066 @@
 package service
 
 import (
-	"PanIndex/Util"
-	"PanIndex/config"
-	"PanIndex/entity"
-	"PanIndex/jobs"
-	"PanIndex/model"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"github.com/bluele/gcache"
+	"github.com/gabriel-vasile/mimetype"
 	"github.com/gin-gonic/gin"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/libsgh/nic"
+	"github.com/px-org/PanIndex/dao"
+	"github.com/px-org/PanIndex/module"
+	"github.com/px-org/PanIndex/pan/base"
+	"github.com/px-org/PanIndex/pan/ftp"
+	"github.com/px-org/PanIndex/pan/webdav"
+	"github.com/px-org/PanIndex/util"
 	uuid "github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
+	"github.com/skip2/go-qrcode"
 	"gorm.io/gorm"
 	"io/ioutil"
-	"os"
-	"path/filepath"
-	"sort"
+	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
-func GetFilesByPath(account entity.Account, path, pwd string) map[string]interface{} {
-	if path == "" {
-		path = "/"
-	}
-	result := make(map[string]interface{})
-	list := []entity.FileNode{}
-	defer func() {
-		if p := recover(); p != nil {
-			log.Errorln(p)
+var UrlCache = gcache.New(100000).LRU().Build()
+var FilesCache = gcache.New(100000).LRU().Build()
+var FileCache = gcache.New(100000).LRU().Build()
+
+func Index(ac module.Account, path, fullPath, sortColumn, sortOrder string, isView bool) ([]module.FileNode, bool, string, string) {
+	fns := []module.FileNode{}
+	isFile := false
+	var err error
+	if ac.CachePolicy == "nc" {
+		fns, isFile, err = GetFilesFromApi(ac, path, fullPath, "default", "null")
+		if err == nil {
+			fns = FilterHideFiles(fns)
+		} else {
+			isFile = false
+			fns = []module.FileNode{}
 		}
-	}()
-	result["HasReadme"] = false
-	if account.Mode == "native" {
-		//列出文件夹相对路径
-		rootPath := account.RootId
-		fullPath := filepath.Join(rootPath, path)
-		if Util.FileExist(fullPath) {
-			if Util.IsDirectory(fullPath) {
-				//是目录
-				// 读取该文件夹下所有文件
-				fileInfos, err := ioutil.ReadDir(fullPath)
-				//默认按照目录，时间倒序排列
-				sort.Slice(fileInfos, func(i, j int) bool {
-					d1 := 0
-					if fileInfos[i].IsDir() {
-						d1 = 1
-					}
-					d2 := 0
-					if fileInfos[j].IsDir() {
-						d2 = 1
-					}
-					if d1 > d2 {
-						return true
-					} else if d1 == d2 {
-						return fileInfos[i].ModTime().After(fileInfos[j].ModTime())
-					} else {
-						return false
-					}
-				})
-				if err != nil {
-					panic(err.Error())
-				} else {
-					for _, fileInfo := range fileInfos {
-						fileId := filepath.Join(fullPath, fileInfo.Name())
-						// 当前文件是隐藏文件(以.开头)则不显示
-						if Util.IsHiddenFile(fileInfo.Name()) {
-							continue
-						}
-						if fileInfo.Name() == "README.md" {
-							result["HasReadme"] = true
-							result["ReadmeContent"] = Util.ReadStringByFile(fileId)
-						}
-						//指定隐藏的文件或目录过滤
-						if config.GloablConfig.HideFileId != "" {
-							listSTring := strings.Split(config.GloablConfig.HideFileId, ",")
-							sort.Strings(listSTring)
-							i := sort.SearchStrings(listSTring, fileId)
-							if i < len(listSTring) && listSTring[i] == fileId {
-								continue
-							}
-						}
-						fileType := Util.GetMimeType(fileInfo)
-						// 实例化FileNode
-						file := entity.FileNode{
-							FileId:     fileId,
-							IsFolder:   fileInfo.IsDir(),
-							FileName:   fileInfo.Name(),
-							FileSize:   int64(fileInfo.Size()),
-							SizeFmt:    Util.FormatFileSize(int64(fileInfo.Size())),
-							FileType:   strings.TrimLeft(filepath.Ext(fileInfo.Name()), "."),
-							Path:       filepath.Join(path, fileInfo.Name()),
-							MediaType:  fileType,
-							LastOpTime: time.Unix(fileInfo.ModTime().Unix(), 0).Format("2006-01-02 15:04:05"),
-						}
-						// 添加到切片中等待json序列化
-						list = append(list, file)
-					}
-				}
-				result["isFile"] = false
-				result["HasPwd"] = false
-				PwdDirIds := config.GloablConfig.PwdDirId
-				for _, pdi := range strings.Split(PwdDirIds, ",") {
-					if strings.Split(pdi, ":")[0] == fullPath && pwd != strings.Split(pdi, ":")[1] {
-						result["HasPwd"] = true
-						result["FileId"] = fullPath
-					}
-				}
-			} else {
-				//是文件
-				fileInfo, err := os.Stat(fullPath)
-				if err != nil {
-					panic(err.Error())
-				} else {
-					fileType := Util.GetMimeType(fileInfo)
-					file := entity.FileNode{
-						FileId:     fullPath,
-						IsFolder:   fileInfo.IsDir(),
-						FileName:   fileInfo.Name(),
-						FileSize:   int64(fileInfo.Size()),
-						SizeFmt:    Util.FormatFileSize(int64(fileInfo.Size())),
-						FileType:   strings.TrimLeft(filepath.Ext(fileInfo.Name()), "."),
-						Path:       filepath.Join(path, fileInfo.Name()),
-						MediaType:  fileType,
-						LastOpTime: time.Unix(fileInfo.ModTime().Unix(), 0).Format("2006-01-02 15:04:05"),
-					}
-					// 添加到切片中等待json序列化
-					list = append(list, file)
-				}
-				result["isFile"] = true
+	} else if ac.CachePolicy == "mc" {
+		if FilesCache.Has(fullPath) {
+			files, err := FilesCache.Get(fullPath)
+			if err == nil {
+				fcb := files.(FilesCacheBean)
+				log.Infof("get file from cache:%s", fullPath)
+				fns = fcb.FileNodes
+				isFile = fcb.IsFile
+			}
+		} else {
+			log.Infof("get file from api:%s", fullPath)
+			fns, isFile, err = GetFilesFromApi(ac, path, fullPath, "default", "null")
+			log.Infof("get file from api result:%d", len(fns))
+			fns = FilterHideFiles(fns)
+			cacheTime := time.Now().Format("2006-01-02 15:04:05")
+			if err == nil {
+				FilesCache.SetWithExpire(fullPath, FilesCacheBean{fns, isFile, cacheTime, util.GetExpireTime(cacheTime, time.Hour*time.Duration(ac.ExpireTimeSpan))}, time.Hour*time.Duration(ac.ExpireTimeSpan))
 			}
 		}
+	} else if ac.CachePolicy == "dc" {
+		fns, isFile = GetFilesFromDb(ac, fullPath, "default", "null")
+		fns = FilterHideFiles(fns)
+	}
+	sortFns := make([]module.FileNode, len(fns))
+	copy(sortFns, fns)
+	util.SortFileNode(sortColumn, sortOrder, sortFns)
+	var lastFile, nextFile = "", ""
+	if isView && isFile {
+		lastFile, nextFile = GetLastNextFile(ac, path, fullPath, "default", "null")
+	}
+	return sortFns, isFile, lastFile, nextFile
+}
+
+type FilesCacheBean struct {
+	FileNodes  []module.FileNode
+	IsFile     bool
+	CacheTime  string
+	ExpireTime string
+}
+
+type FileCacheBean struct {
+	FileNode   module.FileNode
+	CacheTime  string
+	ExpireTime string
+}
+
+type DownUrlCacheBean struct {
+	Url        string
+	CacheTime  string
+	ExpireTime string
+}
+
+func GetFilesFromApi(ac module.Account, path, fullPath, sortColumn, sortOrder string) ([]module.FileNode, bool, error) {
+	var fns []module.FileNode
+	p, _ := base.GetPan(ac.Mode)
+	fileId := GetFileIdByPath(ac, path, fullPath)
+	file, err := p.File(ac, fileId, fullPath)
+	isFile := false
+	if err != nil {
+		log.Error(err)
+	}
+	if !file.IsFolder {
+		//is file
+		fns = append(fns, file)
+		isFile = true
 	} else {
-		model.SqliteDb.Raw("select * from file_node where parent_path=? and `delete`=0 and hide = 0 and account_id=?", path, account.Id).Find(&list)
-		result["isFile"] = false
-		if len(list) == 0 {
-			result["isFile"] = true
-			model.SqliteDb.Raw("select * from file_node where path = ? and is_folder = 0 and `delete`=0 and hide = 0 and account_id=? limit 1", path, account.Id).Find(&list)
-		} else {
-			readmeFile := entity.FileNode{}
-			model.SqliteDb.Raw("select * from file_node where parent_path=? and file_name=? and `delete`=0 and account_id=?", path, "README.md", account.Id).Find(&readmeFile)
-			if !readmeFile.IsFolder && readmeFile.FileName == "README.md" {
-				result["HasReadme"] = true
-				result["ReadmeContent"] = Util.ReadStringByUrl(GetDownlaodUrl(account, readmeFile), readmeFile.FileId)
-			}
+		//is folder
+		fns, err = p.Files(ac, fileId, fullPath, sortColumn, sortOrder)
+		if err != nil {
+			log.Error(err)
 		}
-		result["HasPwd"] = false
-		fileNode := entity.FileNode{}
-		model.SqliteDb.Raw("select * from file_node where path = ? and is_folder = 1 and `delete`=0 and account_id = ?", path, account.Id).First(&fileNode)
-		PwdDirIds := config.GloablConfig.PwdDirId
-		for _, pdi := range strings.Split(PwdDirIds, ",") {
-			if pdi != "" {
-				if strings.Split(pdi, ":")[0] == fileNode.FileId && pwd != strings.Split(pdi, ":")[1] {
-					result["HasPwd"] = true
-					result["FileId"] = fileNode.FileId
+	}
+	return fns, isFile, err
+}
+
+func GetFilesFromDb(ac module.Account, path, sortColumn, sortOrder string) ([]module.FileNode, bool) {
+	var fns []module.FileNode
+	file, isFile := dao.FindFileByPath(ac, path)
+	if isFile && file.FileId != "" && file.Id != "" {
+		fns = append(fns, file)
+	} else {
+		isFile = false
+		fns = dao.FindFileListByPath(ac, path, sortColumn, sortOrder)
+	}
+	return fns, isFile
+}
+
+func Search(searchKey string) []module.FileNode {
+	var fns []module.FileNode
+	//only support db cache mode
+	byPassAccounts := []string{}
+	dao.DB.Model(&module.BypassAccounts{}).
+		Select("max(account_id)").
+		Group("bypass_id").
+		Find(&byPassAccounts)
+	keys := strings.Split(searchKey, ":")
+	if len(byPassAccounts) > 0 {
+		sql := `select
+				fn.*
+			from
+				file_node fn
+			left join account a on
+				fn.account_id = a.id
+			where
+				fn.file_name like ? and a.id in ?`
+		dao.DB.Raw(sql, "%"+searchKey+"%", byPassAccounts).Find(&fns)
+	} else {
+		sql := `select
+				fn.*
+			from
+				file_node fn
+			left join account a on
+				fn.account_id = a.id
+			where
+				fn.file_name like ? and fn.hide = 0`
+		if len(keys) > 1 {
+			searchKey = keys[1]
+			sql += " and a.name=?"
+			dao.DB.Raw(sql, "%"+searchKey+"%", keys[0]).Find(&fns)
+		} else {
+			dao.DB.Raw(sql, "%"+searchKey+"%").Find(&fns)
+		}
+	}
+	return fns
+}
+
+func FilterHideFiles(files []module.FileNode) []module.FileNode {
+	var fns []module.FileNode
+	hideMap := dao.GetHideFilesMap()
+	for _, file := range files {
+		_, ok := hideMap[file.Path]
+		if !ok {
+			fns = append(fns, file)
+		}
+	}
+	return fns
+}
+
+func FilterFilesByType(files []module.FileNode, viewType string) []module.FileNode {
+	var fns []module.FileNode
+	for _, file := range files {
+		if viewType == "" || file.ViewType == viewType {
+			fns = append(fns, file)
+		}
+	}
+	return fns
+}
+
+func HasParent(path string) (bool, string) {
+	hasParent := false
+	parentPath := ""
+	if path != "/" {
+		hasParent = true
+	}
+	parentPath = util.GetParentPath(path)
+	return hasParent, parentPath
+}
+
+func GetFileIdByPath(ac module.Account, path, fullPath string) string {
+	fileId := ac.RootId
+	if path == "/" || path == "" {
+		return fileId
+	}
+	if ac.CachePolicy == "dc" {
+		fileId = dao.GetFileIdByPath(ac.Id, fullPath)
+		return fileId
+	} else if ac.CachePolicy == "mc" {
+		parentPath := util.GetParentPath(fullPath)
+		if FilesCache.Has(parentPath) {
+			files, err := FilesCache.Get(parentPath)
+			if err == nil {
+				fcb := files.(FilesCacheBean)
+				if len(fcb.FileNodes) > 0 {
+					for _, fn := range fcb.FileNodes {
+						if fn.Path == fullPath {
+							return fn.FileId
+						}
+					}
 				}
 			}
 		}
 	}
-	result["List"] = list
-	result["Path"] = path
-	if path == "/" {
-		result["HasParent"] = false
-	} else {
-		result["HasParent"] = true
-	}
-	result["ParentPath"] = PetParentPath(path)
-	if account.Mode == "cloud189" || account.Mode == "native" {
-		result["SurportFolderDown"] = true
-	} else {
-		result["SurportFolderDown"] = false
-	}
-	return result
-}
-
-func SearchFilesByKey(account entity.Account, key string) map[string]interface{} {
-	result := make(map[string]interface{})
-	list := []entity.FileNode{}
-	defer func() {
-		if p := recover(); p != nil {
-			log.Errorln(p)
+	paths := util.GetPrePath(path)
+	for _, pathMap := range paths {
+		fId, ok := LoopGetFileId(ac, fileId, pathMap["PathUrl"], path)
+		fileId = fId
+		if ok {
+			break
 		}
-	}()
-	if account.Mode == "native" {
-		list = Util.FileSearch(account.RootId, "", key)
-	} else {
-		model.SqliteDb.Raw("select * from file_node where file_name like ? and `delete`=0 and hide = 0 and account_id=?", "%"+key+"%", account.Id).Find(&list)
 	}
-	result["List"] = list
-	result["Path"] = "/"
-	result["HasParent"] = false
-	result["ParentPath"] = PetParentPath("/")
-	if account.Mode == "cloud189" || account.Mode == "native" {
-		result["SurportFolderDown"] = true
-	} else {
-		result["SurportFolderDown"] = false
-	}
-	return result
+	return fileId
 }
 
-func GetDownlaodUrl(account entity.Account, fileNode entity.FileNode) string {
-	if account.Mode == "cloud189" {
-		return Util.GetDownlaodUrl(account.Id, fileNode.FileIdDigest)
-	} else if account.Mode == "teambition" {
-		if Util.TeambitionSessions[account.Id].IsPorject {
-			return Util.GetTeambitionProDownUrl("www", account.Id, fileNode.FileId)
-		} else {
-			return Util.GetTeambitionDownUrl(account.Id, fileNode.FileId)
+func LoopGetFileId(ac module.Account, fileId, path, filePath string) (string, bool) {
+	fileName := util.GetFileName(path)
+	p, _ := base.GetPan(ac.Mode)
+	fns, _ := p.Files(ac, fileId, util.GetParentPath(path), "", "")
+	fId, fnPath := GetCurrentId(fileName, fns)
+	if fId != "" {
+		if fnPath == filePath {
+			return fId, true
 		}
-	} else if account.Mode == "teambition-us" {
-		if Util.TeambitionSessions[account.Id].IsPorject {
-			return Util.GetTeambitionProDownUrl("us", account.Id, fileNode.FileId)
-		} else {
-			//国际版暂时没有个人文件
-		}
-	} else if account.Mode == "aliyundrive" {
-		return Util.AliGetDownloadUrl(account.Id, fileNode.FileId)
-	} else if account.Mode == "onedrive" {
-		return Util.GetOneDriveDownloadUrl(account.Id, fileNode.FileId)
-	} else if account.Mode == "native" {
+		return fId, false
+	} else {
+		return "", false
 	}
-	return ""
 }
 
-func GetDownlaodMultiFiles(accountId, fileId string) string {
-	return Util.GetDownlaodMultiFiles(accountId, fileId)
+func GetFileIdFromApi(ac module.Account, path string) string {
+	fileId := ac.RootId
+	paths := util.GetPrePath(path)
+	for _, pathMap := range paths {
+		fId, ok := LoopGetFileId(ac, fileId, pathMap["PathUrl"], path)
+		fileId = fId
+		if ok {
+			break
+		}
+	}
+	return fileId
 }
 
-func GetPath(accountId, fileId string) string {
-	fileNode := entity.FileNode{}
-	model.SqliteDb.Raw("select * from file_node where account_id = ? and file_id = ? and delete = 0 limit 1", accountId, fileId).Find(&fileNode)
-	return fileNode.Path
+func GetCurrentId(pathName string, fns []module.FileNode) (string, string) {
+	for _, fn := range fns {
+		if fn.FileName == pathName {
+			return fn.FileId, fn.Path
+		}
+	}
+	return "", ""
 }
 
-func PetParentPath(p string) string {
-	if p == "/" {
+type DownLock struct {
+	FileId string
+	L      *sync.Mutex
+}
+
+var dls = sync.Map{}
+
+func GetDownloadUrl(ac module.Account, fileId string) string {
+	if fileId == "" {
 		return ""
+	}
+	var dl = DownLock{}
+	if _, ok := dls.Load(fileId); ok {
+		ss, _ := dls.Load(fileId)
+		dl = ss.(DownLock)
 	} else {
-		s := ""
-		ss := strings.Split(p, "/")
-		for i := 0; i < len(ss)-1; i++ {
-			if ss[i] != "" {
-				s += "/" + ss[i]
-			}
-		}
-		if s == "" {
-			s = "/"
-		}
-		return s
+		dl.FileId = fileId
+		dl.L = new(sync.Mutex)
+		dls.LoadOrStore(fileId, dl)
 	}
+	downUrl := dl.GetDownlaodUrl(ac, fileId)
+	return downUrl
 }
 
-//获取查询游标start
-func GetPageStart(pageNo, pageSize int) int {
-	if pageNo < 1 {
-		pageNo = 1
-	}
-	if pageSize < 1 {
-		pageSize = 0
-	}
-	return (pageNo - 1) * pageSize
-}
-
-//获取总页数
-func GetTotalPage(totalCount, pageSize int) int {
-	if pageSize == 0 {
-		return 0
-	}
-	if totalCount%pageSize == 0 {
-		return totalCount / pageSize
-	} else {
-		return totalCount/pageSize + 1
-	}
-}
-
-//刷新目录缓存
-func UpdateFolderCache(account entity.Account) {
-	Util.GC = gcache.New(10).LRU().Build()
-	model.SqliteDb.Delete(entity.FileNode{})
-	if account.Mode == "cloud189" {
-		Util.Cloud189GetFiles(account.Id, account.RootId, account.RootId, "")
-	} else if account.Mode == "teambition" {
-		Util.TeambitionGetFiles(account.Id, account.RootId, account.RootId, "/")
-	} else if account.Mode == "native" {
-	}
-}
-
-//刷新登录cookie
-func RefreshCookie(account entity.Account) {
-	if account.Mode == "cloud189" {
-		Util.Cloud189Login(account.Id, account.User, account.Password)
-	} else if account.Mode == "teambition" {
-		Util.TeambitionLogin(account.Id, account.User, account.Password)
-	} else if account.Mode == "native" {
-	}
-}
-func IsDirectory(filename string) bool {
-	info, err := os.Stat(filename)
-	if err != nil {
-		return false
-	}
-	return info.IsDir()
-}
-
-func IsFile(filename string) bool {
-	info, err := os.Stat(filename)
-	if err != nil {
-		return false
-	}
-	return !info.IsDir()
-}
-
-func GetConfig() entity.Config {
-	c := entity.Config{}
-	accounts := []entity.Account{}
-	damagou := entity.Damagou{}
-	model.SqliteDb.Raw("select * from config where 1=1 limit 1").Find(&c)
-	model.SqliteDb.Raw("select * from account order by `default`desc").Find(&accounts)
-	model.SqliteDb.Raw("select * from damagou where 1-1 limit 1").Find(&damagou)
-	c.Accounts = accounts
-	c.Damagou = damagou
-	config.GloablConfig = c
-	return c
-}
-
-func SaveConfig(config map[string]interface{}) {
-	if config["accounts"] == nil {
-		//基本配置
-		model.SqliteDb.Table("config").Where("1 = 1").Updates(config)
-		if config["hide_file_id"] != nil {
-			hideFiles := config["hide_file_id"].(string)
-			if hideFiles != "" {
-				model.SqliteDb.Table("file_node").Where("1 = 1").Update("hide", 0)
-				for _, hf := range strings.Split(hideFiles, ",") {
-					model.SqliteDb.Table("file_node").Where("file_id = ?", hf).Update("hide", 1)
-				}
-			}
+func (dl *DownLock) GetDownlaodUrl(account module.Account, fileId string) string {
+	var downloadUrl = ""
+	if UrlCache.Has(account.Id + fileId) {
+		downUrlCache, err := UrlCache.Get(account.Id + fileId)
+		if err == nil {
+			downloadUrl = downUrlCache.(DownUrlCacheBean).Url
+			log.Debugf("get download url from cache:%s", downloadUrl)
 		}
 	} else {
-		//账号信息
-		for _, account := range config["accounts"].([]interface{}) {
-			mode := account.(map[string]interface{})["Mode"]
-			ID := ""
-			if account.(map[string]interface{})["id"] != nil && account.(map[string]interface{})["id"] != "" {
-				old := entity.Account{}
-				model.SqliteDb.Table("account").Where("id = ?", account.(map[string]interface{})["id"]).First(&old)
-				if account.(map[string]interface{})["password"] == "" {
-					delete(account.(map[string]interface{}), "password")
-				}
-				//更新网盘账号
-				model.SqliteDb.Table("account").Where("id = ?", account.(map[string]interface{})["id"]).Updates(account.(map[string]interface{}))
-				if mode != old.Mode {
-					delete(Util.CLoud189Sessions, old.Id)
-					delete(Util.TeambitionSessions, old.Id)
-					if mode == "cloud189" {
-						Util.CLoud189Sessions[old.Id] = nic.Session{}
-					} else if mode == "teambition" {
-						Util.TeambitionSessions[old.Id] = entity.Teambition{nic.Session{}, "", "", "", "", "", false}
-					} else if mode == "teambition-us" {
-						Util.TeambitionSessions[old.Id] = entity.Teambition{nic.Session{}, "", "", "", "", "", false}
-					}
-				}
-				ID = old.Id
+		p, _ := base.GetPan(account.Mode)
+		url, err := p.GetDownloadUrl(account, fileId)
+		if err != nil {
+			log.Error(err)
+		}
+		downloadUrl = url
+		cacheTime := time.Now().Format("2006-01-02 15:04:05")
+		if downloadUrl != "" {
+			if account.Mode == "aliyundrive" {
+				UrlCache.SetWithExpire(account.Id+fileId, DownUrlCacheBean{downloadUrl, cacheTime, util.GetExpireTime(cacheTime, time.Minute*230)}, time.Minute*230)
 			} else {
-				//添加网盘账号
-				id := uuid.NewV4().String()
-				ID = id
-				account.(map[string]interface{})["id"] = id
-				account.(map[string]interface{})["status"] = 1
-				account.(map[string]interface{})["cookie_status"] = 1
-				account.(map[string]interface{})["files_count"] = 0
-				model.SqliteDb.Table("account").Create(account.(map[string]interface{}))
-				if mode == "cloud189" {
-					Util.CLoud189Sessions[id] = nic.Session{}
-				} else if mode == "teambition" {
-					Util.TeambitionSessions[id] = entity.Teambition{nic.Session{}, "", "", "", "", "", false}
-				} else if mode == "teambition-us" {
-					Util.TeambitionSessions[id] = entity.Teambition{nic.Session{}, "", "", "", "", "", false}
-				}
+				UrlCache.SetWithExpire(account.Id+fileId, DownUrlCacheBean{downloadUrl, cacheTime, util.GetExpireTime(cacheTime, time.Minute*10)}, time.Minute*10)
 			}
-			ac := entity.Account{}
-			model.SqliteDb.Table("account").Where("id=?", ID).Take(&ac)
-			go jobs.SyncInit(ac)
+			log.Debugf("get download url from api:" + downloadUrl)
 		}
 	}
-	go GetConfig()
-	//其他（打码狗）
+	return downloadUrl
 }
-func DeleteAccount(id string) {
-	//删除账号对应节点数据
-	model.SqliteDb.Where("account_id = ?", id).Delete(entity.FileNode{})
-	//删除账号数据
-	var a entity.Account
-	a.Id = id
-	model.SqliteDb.Model(entity.Account{}).Delete(a)
-	go GetConfig()
-	delete(Util.CLoud189Sessions, id)
-	delete(Util.TeambitionSessions, id)
-}
-func GetAccount(id string) entity.Account {
-	account := entity.Account{}
-	model.SqliteDb.Where("id = ?", id).First(&account)
-	return account
-}
-func SetDefaultAccount(id string) {
-	accountMap := make(map[string]interface{})
-	accountMap["default"] = 0
-	model.SqliteDb.Model(entity.Account{}).Where("1=1").Updates(accountMap)
-	accountMap["default"] = 1
-	model.SqliteDb.Table("account").Where("id=?", id).Updates(accountMap)
-	go GetConfig()
-}
-func EnvToConfig() {
-	config := os.Getenv("PAN_INDEX_CONFIG")
-	if config != "" {
-		//从环境变量写入数据库
-		c := make(map[string]interface{})
-		jsoniter.UnmarshalFromString(config, &c)
-		if os.Getenv("PORT") != "" {
-			c["port"] = os.Getenv("PORT")
+
+// clear file memory cache
+func ClearFileCache(p string) {
+	keys := FilesCache.Keys(false)
+	for _, key := range keys {
+		k := key.(string)
+		if strings.HasPrefix(k, p) {
+			FilesCache.Remove(k)
 		}
-		c["damagou"] = nil
-		delete(c, "damagou")
-		model.SqliteDb.Where("1 = 1").Delete(&entity.Damagou{})
-		model.SqliteDb.Where("1 = 1").Delete(&entity.Account{})
-		//model.SqliteDb.Where("1 = 1").Delete(&entity.FileNode{})
-		for _, account := range c["accounts"].([]interface{}) {
-			//添加网盘账号
-			account.(map[string]interface{})["status"] = 1
-			account.(map[string]interface{})["files_count"] = 0
-			model.SqliteDb.Table("account").Create(account.(map[string]interface{}))
-		}
-		delete(c, "accounts")
-		SaveConfig(c)
 	}
 }
-func Upload(accountId, path string, c *gin.Context) string {
+
+// upload file
+func Upload(accountId, p string, c *gin.Context) string {
+	_, fullPath, path, _ := util.ParseFullPath(p, "")
 	form, _ := c.MultipartForm()
 	files := form.File["uploadFile"]
-	dbFile := entity.FileNode{}
-	account := entity.Account{}
-	result := model.SqliteDb.Raw("select * from account where id=?", accountId).Take(&account)
+	account := module.Account{}
+	result := dao.DB.Raw("select * from account where id=?", accountId).Take(&account)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return "指定的账号不存在"
 	}
-	if account.Mode == "native" {
-		p := filepath.FromSlash(account.RootId + path)
-		if !Util.FileExist(p) {
-			return "指定的目录不存在"
-		}
-		//服务器本地模式
-		for _, file := range files {
-			log.Debugf("开始上传文件：%s，大小：%d", file.Filename, file.Size)
-			t1 := time.Now()
-			p = filepath.FromSlash(account.RootId + path + "/" + file.Filename)
-			c.SaveUploadedFile(file, p)
-			log.Debugf("文件：%s，上传成功，耗时：%s", file.Filename, Util.ShortDur(time.Now().Sub(t1)))
-		}
+	pan, _ := base.GetPan(account.Mode)
+	fileId := GetFileIdByPath(account, path, fullPath)
+	if fileId == "" {
+		return "指定目录不存在"
+	}
+	fileInfos := []*module.UploadInfo{}
+	for _, file := range files {
+		fileContent, _ := file.Open()
+		byteContent, _ := ioutil.ReadAll(fileContent)
+		fileInfos = append(fileInfos, &module.UploadInfo{
+			FileName:    file.Filename,
+			FileSize:    file.Size,
+			ContentType: file.Header.Get("Content-Type"),
+			Content:     byteContent,
+		})
+	}
+	ok, r, err := pan.UploadFiles(account, fileId, fileInfos, true)
+	if ok && err == nil {
+		log.Debug(r)
 		return "上传成功"
 	} else {
-		if path == "/" {
-			result = model.SqliteDb.Raw("select * from file_node where parent_path=? and `delete`=0 and account_id=? limit 1", path, accountId).Take(&dbFile)
-		} else {
-			result = model.SqliteDb.Raw("select * from file_node where path=? and `delete`=0 and account_id=?", path, accountId).Take(&dbFile)
-		}
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return "指定的目录不存在"
-		} else {
-			fileId := dbFile.FileId
-			if path == "/" {
-				fileId = dbFile.ParentId
-			}
-			if account.Mode == "teambition" && !Util.TeambitionSessions[accountId].IsPorject {
-				//teambition 个人文件上传
-				Util.TeambitionUpload(accountId, fileId, files)
-			} else if account.Mode == "teambition" && Util.TeambitionSessions[accountId].IsPorject {
-				//teambition 项目文件上传
-				Util.TeambitionProUpload("", accountId, fileId, files)
-			} else if account.Mode == "teambition-us" && Util.TeambitionSessions[accountId].IsPorject {
-				//teambition-us 项目文件上传
-				Util.TeambitionProUpload("us", accountId, fileId, files)
-			} else if account.Mode == "cloud189" {
-				//天翼云盘文件上传
-				Util.Cloud189UploadFiles(accountId, fileId, files)
-			} else if account.Mode == "aliyundrive" {
-				//阿里云盘文件上传
-				Util.AliUpload(accountId, fileId, files)
-			} else if account.Mode == "onedrive" {
-				//微软云盘文件上传
-				Util.OneDriveUpload(accountId, fileId, files)
-			}
-			return "上传成功"
-		}
+		log.Debug(r)
+		return "上传失败"
 	}
 }
 
+// sync file cache
 func Async(accountId, path string) string {
-	account := entity.Account{}
-	result := model.SqliteDb.Raw("select * from account where id=?", accountId).Take(&account)
-	dbFile := entity.FileNode{}
+	account := module.Account{}
+	result := dao.DB.Raw("select * from account where id=?", accountId).Take(&account)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return "指定的账号不存在"
 	}
-	if account.Mode == "native" {
-		return "无需刷新"
+	account.SyncDir = path
+	account.SyncChild = 0
+	if account.CachePolicy == "dc" {
+		dao.SyncFilesCache(account)
 	} else {
-		if path == "/" {
-			result = model.SqliteDb.Raw("select * from file_node where parent_path=? and `delete`=0 and account_id=? limit 1", path, accountId).Take(&dbFile)
-		} else {
-			result = model.SqliteDb.Raw("select * from file_node where path=? and `delete`=0 and account_id=?", path, accountId).Take(&dbFile)
-		}
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return "指定的目录不存在"
-		} else {
-			fileId := dbFile.FileId
-			if path == "/" {
-				fileId = dbFile.ParentId
-			}
-			if account.Mode == "teambition" && !Util.TeambitionSessions[accountId].IsPorject {
-				//teambition 个人文件
-				Util.TeambitionGetFiles(account.Id, fileId, fileId, path)
-			} else if account.Mode == "teambition" && Util.TeambitionSessions[accountId].IsPorject {
-				//teambition 项目文件
-				Util.TeambitionGetProjectFiles("www", account.Id, fileId, path)
-			} else if account.Mode == "teambition-us" && Util.TeambitionSessions[accountId].IsPorject {
-				//teambition-us 项目文件
-				Util.TeambitionGetProjectFiles("us", account.Id, fileId, path)
-			} else if account.Mode == "cloud189" {
-				Util.Cloud189GetFiles(account.Id, fileId, fileId, path)
-			} else if account.Mode == "aliyundrive" {
-				Util.AliGetFiles(account.Id, fileId, fileId, path)
-			}
-			refreshFileNodes(account.Id, fileId)
-			return "刷新成功"
-		}
+		ClearFileCache(path)
 	}
-}
-func refreshFileNodes(accountId, fileId string) {
-	tmpList := []entity.FileNode{}
-	list := []entity.FileNode{}
-	model.SqliteDb.Raw("select * from file_node where parent_id=? and `delete`=0 and account_id=?", fileId, accountId).Find(&tmpList)
-	getAllNodes(&tmpList, &list)
-	for _, fn := range list {
-		model.SqliteDb.Where("id=?", fn.Id).Delete(entity.FileNode{})
-	}
-	model.SqliteDb.Table("file_node").Where("account_id=?", accountId).Update("delete", 0)
+	return "刷新成功"
 }
 
-func getAllNodes(tmpList, list *[]entity.FileNode) {
-	for _, fn := range *tmpList {
-		tmpList = &[]entity.FileNode{}
-		model.SqliteDb.Raw("select * from file_node where parent_id=? and `delete`=0", fn.FileId).Find(&tmpList)
-		*list = append(*list, fn)
-		if len(*tmpList) != 0 {
-			getAllNodes(tmpList, list)
+// short url & qrcode
+func ShortInfo(path, prefix string) (string, string, string) {
+	si := module.ShareInfo{}
+	dao.DB.Raw("select * from share_info where file_path = ?", path).First(&si)
+	shortUrl := ""
+	if path == "" {
+		return "", "", "无效的id"
+	}
+	shortCode := ""
+	if si.ShortCode != "" {
+		shortCode = si.ShortCode
+	} else {
+		shortCodes, err := util.Transform(path)
+		if err != nil {
+			log.Errorln(err)
+			return "", "", "短链生成失败"
+		}
+		for i, code := range shortCodes {
+			si = module.ShareInfo{}
+			dao.DB.Raw("select * from share_info where short_code = ?", code).First(&si)
+			if si.ShortCode == "" {
+				shortCode = shortCodes[i]
+				break
+			}
+		}
+		dao.DB.Create(module.ShareInfo{
+			path, shortCode, []module.PwdFiles{},
+		})
+	}
+	go dao.InitGlobalConfig()
+	shortUrl = prefix + shortCode
+	png, err := qrcode.Encode(shortUrl, qrcode.Medium, 256)
+	if err != nil {
+		panic(err)
+	}
+	dataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+	return shortUrl, dataURI, "短链生成成功"
+}
+
+// get file data
+func GetFileData(account module.Account, downUrl, r string) ([]byte, string, int) {
+	client := httpClient(r)
+	req, _ := http.NewRequest("GET", downUrl, nil)
+	req.Header.Add("Range", r)
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Errorln(err)
+	}
+	defer resp.Body.Close()
+	data, _ := ioutil.ReadAll(resp.Body)
+	mtype := mimetype.Detect(data)
+	return data, mtype.String(), resp.StatusCode
+}
+
+func httpClient(r string) *http.Client {
+	client := http.Client{
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			r.URL.Opaque = r.URL.Path
+			return nil
+		},
+	}
+	return &client
+}
+
+func AccountsToNodes(host string) []module.FileNode {
+	fns := []module.FileNode{}
+	ids := map[string]string{}
+	for _, bypass := range module.GloablConfig.BypassList {
+		fn := module.FileNode{
+			FileId:     fmt.Sprintf("/%s", bypass.Name),
+			IsFolder:   true,
+			FileName:   bypass.Name,
+			FileSize:   0,
+			SizeFmt:    "-",
+			FileType:   "",
+			Path:       fmt.Sprintf("/%s", bypass.Name),
+			ViewType:   "",
+			LastOpTime: "",
+			ParentId:   "",
+		}
+		fns = append(fns, fn)
+		for _, ac := range bypass.Accounts {
+			ids[ac.Id] = ac.Id
 		}
 	}
+	for _, account := range module.GloablConfig.Accounts {
+		_, exists := ids[account.Id]
+		if !exists {
+			fn := module.FileNode{
+				FileId:     fmt.Sprintf("/%s", account.Name),
+				IsFolder:   true,
+				FileName:   account.Name,
+				FileSize:   int64(account.FilesCount),
+				SizeFmt:    "-",
+				FileType:   "",
+				Path:       fmt.Sprintf("/%s", account.Name),
+				ViewType:   "",
+				LastOpTime: account.LastOpTime,
+				ParentId:   "",
+			}
+			if host != "" && account.Host != "" {
+				if host == account.Host {
+					fns = append(fns, fn)
+				}
+			} else {
+				fns = append(fns, fn)
+			}
+		}
+	}
+	return fns
+}
+
+func GetRedirectUri(shorCode string) (string, string) {
+	redirectUri := "/"
+	v := ""
+	si := module.ShareInfo{}
+	result := dao.DB.Raw("select * from share_info where short_code=?", shorCode).First(&si)
+	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			if module.GloablConfig.EnablePreview == "0" || module.GloablConfig.ShortAction == "1" {
+				redirectUri = si.FilePath
+			} else {
+				v = "v"
+				redirectUri = si.FilePath
+			}
+		}
+	}
+	return redirectUri, v
+}
+
+// path: filePath
+func GetLastNextFile(ac module.Account, path, fullPath, sortColumn, sortOrder string) (string, string) {
+	var fns []module.FileNode
+	var err error
+	parentPath := util.GetParentPath(path)
+	fileFullPath := fullPath
+	fullPath = util.GetParentPath(fullPath)
+	//get from cache first
+	if FilesCache.Has(fullPath) {
+		files, err := FilesCache.Get(fullPath)
+		if err == nil {
+			fcb := files.(FilesCacheBean)
+			log.Debugf("get file from cache:%s", fullPath)
+			fns = fcb.FileNodes
+		}
+	} else {
+		if ac.CachePolicy == "dc" {
+			fns, _ = GetFilesFromDb(ac, fullPath, "default", "null")
+		} else {
+			fns, _, err = GetFilesFromApi(ac, parentPath, fullPath, sortColumn, sortOrder)
+			fns = FilterHideFiles(fns)
+			if err == nil {
+				cacheTime := time.Now().Format("2006-01-02 15:04:05")
+				FilesCache.SetWithExpire(fullPath, FilesCacheBean{fns, false, cacheTime, util.GetExpireTime(cacheTime, time.Hour*time.Duration(ac.ExpireTimeSpan))}, time.Hour*time.Duration(ac.ExpireTimeSpan))
+			}
+		}
+	}
+	util.SortFileNode(sortColumn, sortOrder, fns)
+	var lastFile, nextFile = "", ""
+	for i, fn := range fns {
+		if fn.Path == fileFullPath && i > 0 {
+			if !fns[i-1].IsFolder {
+				lastFile = fns[i-1].Path
+			}
+		}
+		if fn.Path == fileFullPath && i < len(fns)-1 {
+			if !fns[i+1].IsFolder {
+				nextFile = fns[i+1].Path
+			}
+		}
+	}
+	return lastFile, nextFile
+}
+
+func GetFiles(ac module.Account, path, fullPath, sortColumn, sortOrder, viewType string) []module.FileNode {
+	var fns []module.FileNode
+	var err error
+	//get from cache first
+	if FilesCache.Has(fullPath) {
+		files, err := FilesCache.Get(fullPath)
+		if err == nil {
+			fcb := files.(FilesCacheBean)
+			log.Debugf("get file from cache:%s", fullPath)
+			fns = fcb.FileNodes
+		}
+	} else {
+		if ac.CachePolicy == "dc" {
+			fns, _ = GetFilesFromDb(ac, fullPath, "default", "null")
+		} else {
+			fns, _, err = GetFilesFromApi(ac, path, fullPath, sortColumn, sortOrder)
+			fns = FilterHideFiles(fns)
+			if err == nil {
+				cacheTime := time.Now().Format("2006-01-02 15:04:05")
+				FilesCache.SetWithExpire(fullPath, FilesCacheBean{fns, false, cacheTime, util.GetExpireTime(cacheTime, time.Hour*time.Duration(ac.ExpireTimeSpan))}, time.Hour*time.Duration(ac.ExpireTimeSpan))
+			}
+		}
+	}
+	fns = FilterFilesByType(fns, viewType)
+	util.SortFileNode(sortColumn, sortOrder, fns)
+	return fns
+}
+
+func GetCacheData(pathEsc string) []module.Cache {
+	cache := []module.Cache{}
+	fns := []module.FileNode{}
+	if pathEsc != "" {
+		dao.DB.Raw("select * from file_node where is_delete = 0 and path like ?", "%"+pathEsc+"%").Find(&fns)
+	} else {
+		dao.DB.Raw("select * from file_node where is_delete = 0 limit 100").Find(&fns)
+	}
+	for _, fn := range fns {
+		cache = append(cache, module.Cache{fn.Path, fn.CreateTime, "", "DB", fn})
+	}
+	filesCache := FilesCache.GetALL(false)
+	for filePath, data := range filesCache {
+		fc := data.(FilesCacheBean)
+		if pathEsc != "" {
+			if strings.Contains(filePath.(string), pathEsc) {
+				cache = append(cache, module.Cache{filePath.(string), fc.CacheTime, fc.ExpireTime, "M-Files", fc.FileNodes})
+			}
+		} else {
+			cache = append(cache, module.Cache{filePath.(string), fc.CacheTime, fc.ExpireTime, "M-Files", fc.FileNodes})
+		}
+	}
+	fileCache := FileCache.GetALL(false)
+	for filePath, data := range fileCache {
+		fc := data.(FileCacheBean)
+		if pathEsc != "" {
+			if strings.Contains(filePath.(string), pathEsc) {
+				cache = append(cache, module.Cache{filePath.(string), fc.CacheTime, fc.ExpireTime, "M-File", fc.FileNode})
+			}
+		} else {
+			cache = append(cache, module.Cache{filePath.(string), fc.CacheTime, fc.ExpireTime, "M-File", fc.FileNode})
+		}
+	}
+	urlCache := UrlCache.GetALL(false)
+	for path, data := range urlCache {
+		downUrlCache := data.(DownUrlCacheBean)
+		if pathEsc != "" {
+			if strings.Contains(path.(string), pathEsc) {
+				cache = append(cache, module.Cache{path.(string), downUrlCache.CacheTime, downUrlCache.ExpireTime, "M-Download", downUrlCache.Url})
+			}
+		} else {
+			cache = append(cache, module.Cache{path.(string), downUrlCache.CacheTime, downUrlCache.ExpireTime, "M-Download", downUrlCache.Url})
+		}
+	}
+	return cache
+}
+
+func GetCacheByPath(path string) []module.Cache {
+	cache := []module.Cache{}
+	fn := module.FileNode{}
+	dao.DB.Raw("select * from file_node where is_delete = 0 and path=? limit 100", path).First(&fn)
+	if fn.Path != "" {
+		cache = append(cache, module.Cache{fn.Path, fn.CreateTime, "", "DB", fn})
+	}
+	filesCache, err := FilesCache.Get(path)
+	if err == nil {
+		fc := filesCache.(FilesCacheBean)
+		cache = append(cache, module.Cache{path, fc.CacheTime, fc.ExpireTime, "M-Files", fc.FileNodes})
+	}
+	fileCache, err := FileCache.Get(path)
+	if err == nil {
+		fc := fileCache.(FileCacheBean)
+		cache = append(cache, module.Cache{path, fc.CacheTime, fc.ExpireTime, "M-File", fc.FileNode})
+	}
+	urlCache, err := UrlCache.Get(path)
+	if err == nil {
+		uc := urlCache.(DownUrlCacheBean)
+		cache = append(cache, module.Cache{path, uc.CacheTime, uc.ExpireTime, "M-Download", uc.Url})
+	}
+	return cache
+}
+
+func CacheClear(path string, isLoopChildren string) {
+	if isLoopChildren == "0" {
+		keys := FilesCache.Keys(false)
+		for _, key := range keys {
+			if key.(string) == path || strings.HasPrefix(key.(string)+"/", path) {
+				FilesCache.Remove(key)
+			}
+		}
+	} else {
+		FilesCache.Remove(path)
+	}
+	FileCache.Remove(path)
+	UrlCache.Remove(path)
+	accounts, cachePath := dao.FindAccountsByPath(path)
+	for _, account := range accounts {
+		account.SyncDir = cachePath
+		if isLoopChildren == "0" {
+			account.SyncChild = 0
+		} else {
+			account.SyncChild = 1
+		}
+		go dao.SyncFilesCache(account)
+	}
+}
+
+func GetBypassByAccountId(accountId string) module.Bypass {
+	return dao.SelectBypassByAccountId(accountId)
+}
+
+func UpdateCache(account module.Account, cachePath string) string {
+	msg := "缓存清理成功"
+	if account.CachePolicy == "nc" {
+		msg = "当前网盘无需刷新操作！"
+	} else if account.CachePolicy == "mc" {
+		ClearFileCache(cachePath)
+	} else {
+		if dao.SYNC_STATUS == 1 {
+			msg = "缓存任务正在执行，请稍后重试！"
+		} else {
+			if account.Status == -1 {
+				msg = "目录缓存中，请勿重复操作！"
+			} else {
+				account.SyncDir = cachePath
+				account.SyncChild = 0
+				dao.DB.Table("account").Where("id=?", account.Id).UpdateColumn("status", -1)
+				if dao.DB_TYPE == "sqlite" {
+					dao.SYNC_STATUS = 1
+				}
+				go dao.SyncFilesCache(account)
+				go dao.InitGlobalConfig()
+				msg = "正在缓存目录，请稍后刷新页面查看缓存结果！"
+			}
+		}
+	}
+	return msg
+}
+
+func BatchUpdateCache(ids []string) string {
+	msg := "缓存清理成功"
+	if dao.SYNC_STATUS == 1 {
+		msg = "缓存任务正在执行，请稍后重试！"
+	} else {
+		go func() {
+			accounts := dao.SelectAccountsById(ids)
+			for _, account := range accounts {
+
+				bypass := GetBypassByAccountId(account.Id)
+				cachePath := "/" + account.Name
+				if bypass.Name != "" {
+					cachePath = "/" + bypass.Name
+				}
+				if account.CachePolicy == "nc" {
+				} else if account.CachePolicy == "mc" {
+					ClearFileCache(cachePath)
+				} else {
+					account.SyncDir = cachePath
+					account.SyncChild = 0
+					dao.DB.Table("account").Where("id=?", account.Id).UpdateColumn("status", -1)
+					if dao.DB_TYPE == "sqlite" {
+						dao.InitGlobalConfig()
+						dao.SyncFilesCache(account)
+					} else {
+						go dao.InitGlobalConfig()
+						go dao.SyncFilesCache(account)
+					}
+
+				}
+			}
+		}()
+		msg = "正在缓存目录，请稍后刷新页面查看缓存结果！"
+	}
+	return msg
+}
+
+func GetAccounts() []module.Account {
+	accounts := []module.Account{}
+	bacIds := []string{}
+	bypasses := dao.GetBypassList()
+	if len(bypasses) > 0 {
+		for _, bypass := range bypasses {
+			ac := module.Account{}
+			ac.Name = bypass.Name
+			ac.Mode = "native"
+			accounts = append(accounts, ac)
+			if len(bypass.Accounts) > 0 {
+				for _, bac := range bypass.Accounts {
+					bacIds = append(bacIds, bac.Id)
+				}
+			}
+		}
+	}
+	if len(module.GloablConfig.Accounts) > 0 {
+		for _, account := range module.GloablConfig.Accounts {
+			f := false
+			if len(bacIds) > 0 {
+				for _, id := range bacIds {
+					if id == account.Id {
+						f = true
+					}
+				}
+			}
+			if !f {
+				accounts = append(accounts, account)
+			}
+		}
+	}
+	return accounts
+}
+
+func Files(ac module.Account, path, fullPath string) []module.FileNode {
+	fns := []module.FileNode{}
+	isFile := false
+	var err error
+	if ac.CachePolicy == "nc" {
+		fns, isFile, _ = GetFilesFromApi(ac, path, fullPath, "default", "null")
+		fns = FilterHideFiles(fns)
+	} else if ac.CachePolicy == "mc" {
+		if FilesCache.Has(fullPath) {
+			files, err := FilesCache.Get(fullPath)
+			if err == nil {
+				fcb := files.(FilesCacheBean)
+				log.Debugf("get file from cache:%s", fullPath)
+				fns = fcb.FileNodes
+				isFile = fcb.IsFile
+			}
+		} else {
+			fns, isFile, err = GetFilesFromApi(ac, path, fullPath, "default", "null")
+			if err == nil {
+				fns = FilterHideFiles(fns)
+				cacheTime := time.Now().Format("2006-01-02 15:04:05")
+				FilesCache.SetWithExpire(fullPath, FilesCacheBean{fns, isFile, cacheTime, util.GetExpireTime(cacheTime, time.Hour*time.Duration(ac.ExpireTimeSpan))}, time.Hour*time.Duration(ac.ExpireTimeSpan))
+			}
+		}
+	} else if ac.CachePolicy == "dc" {
+		fns, isFile = GetFilesFromDb(ac, fullPath, "default", "null")
+		fns = FilterHideFiles(fns)
+	}
+
+	return fns
+}
+
+func DeleteFile(ac module.Account, path, fullPath string) error {
+	//1. delete file from disk
+	disk, _ := base.GetPan(ac.Mode)
+	fileId := GetFileIdByPath(ac, path, fullPath)
+	_, _, err := disk.Remove(ac, fileId)
+	//2. delete file from cache
+	if err == nil {
+		FileCache.Remove(fullPath)
+		FilesCache.Remove(fullPath)
+		FilesCache.Remove(util.GetParentPath(fullPath))
+		dao.DeleteFileNodes(ac.Id, fileId)
+	}
+	return err
+}
+
+func GetFileFromApi(ac module.Account, path, fullPath string) (module.FileNode, error) {
+	p, _ := base.GetPan(ac.Mode)
+	fileId := GetFileIdByPath(ac, path, fullPath)
+	if fileId != "" || (fileId == "" && path == "/") {
+		file, err := p.File(ac, fileId, fullPath)
+		return file, err
+	}
+	return module.FileNode{}, nil
+}
+
+func File(ac module.Account, path, fullPath string) (module.FileNode, error) {
+	if ac.CachePolicy == "nc" {
+		return GetFileFromApi(ac, path, fullPath)
+	} else if ac.CachePolicy == "mc" {
+		if FileCache.Has(fullPath) {
+			files, err := FileCache.Get(fullPath)
+			if err == nil {
+				fcb := files.(FileCacheBean)
+				log.Debugf("get file from cache:%s", fullPath)
+				return fcb.FileNode, nil
+			}
+		} else {
+			fn, err := GetFileFromApi(ac, path, fullPath)
+			cacheTime := time.Now().Format("2006-01-02 15:04:05")
+			FileCache.SetWithExpire(fullPath, FileCacheBean{fn, cacheTime, util.GetExpireTime(cacheTime, time.Hour*time.Duration(ac.ExpireTimeSpan))}, time.Hour*time.Duration(ac.ExpireTimeSpan))
+			return fn, err
+		}
+	} else if ac.CachePolicy == "dc" {
+		fn, _ := dao.FindFileByPath(ac, fullPath)
+		return fn, nil
+	}
+	return module.FileNode{}, nil
+}
+
+// webdav upload callback
+func UploadCall(account module.Account, file module.FileNode, overwrite bool) {
+	if account.CachePolicy == "mc" {
+		parentPath := util.GetParentPath(file.Path)
+		FilesCache.Remove(parentPath)
+		FileCache.Remove(file.Path)
+	} else if account.CachePolicy == "dc" {
+		file.Id = uuid.NewV4().String()
+		file.IsDelete = 0
+		fn := module.FileNode{}
+		exist := false
+		result := dao.DB.Table("file_node").
+			Where("path=?", file.Path).Take(&fn)
+		if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			exist = true
+		}
+		if overwrite && exist {
+			dao.DB.Table("file_node").
+				Where("path=?", file.Path).
+				Update("last_op_time", file.LastOpTime).
+				Update("file_size", file.FileSize).
+				Update("size_fmt", util.FormatFileSize(file.FileSize))
+		} else {
+			dao.DB.Create(&file)
+		}
+	}
+}
+
+// webdav mkdir callback
+func MkdirCall(account module.Account, file module.FileNode) {
+	UploadCall(account, file, false)
+}
+
+// webdav move callback
+func MoveCall(account module.Account, fileId, srcFullPath, dstFullPath string) {
+	UrlCache.Remove(account.Id + fileId)
+	if account.CachePolicy == "mc" {
+		parentPath := util.GetParentPath(srcFullPath)
+		dstParentPath := util.GetParentPath(dstFullPath)
+		FilesCache.Remove(parentPath)
+		FilesCache.Remove(dstParentPath)
+		FileCache.Remove(dstFullPath)
+		FileCache.Remove(srcFullPath)
+	} else if account.CachePolicy == "dc" {
+		fn := module.FileNode{}
+		dao.DB.Where("path=?", srcFullPath).First(&fn)
+		p, _ := base.GetPan(account.Mode)
+		newFn, _ := p.File(account, fileId, dstFullPath)
+		fn.LastOpTime = newFn.LastOpTime
+		fn.Path = newFn.Path
+		fn.ParentPath = newFn.ParentPath
+		fn.FileId = newFn.FileId
+		fn.ParentId = newFn.ParentId
+		fn.FileName = newFn.FileName
+		dao.DB.Model(&module.FileNode{}).Where("id=?", fn.Id).Updates(fn)
+		if fn.IsFolder {
+			//TODO if file_id is path may not work
+			account.SyncDir = newFn.Path
+			account.SyncChild = 0
+			dao.SyncFilesCache(account)
+		}
+	}
+}
+
+func FtpDownload(ac module.Account, downUrl string, fileNode module.FileNode, c *gin.Context) {
+	p, _ := base.GetPan(ac.Mode)
+	statusCode := http.StatusOK
+	if c.GetHeader("Range") != "" {
+		statusCode = http.StatusPartialContent
+	}
+	r, err := p.(*ftp.FTP).ReadFileReader(ac, downUrl, 0)
+	defer r.Close()
+	if err == nil {
+		fileName := url.QueryEscape(fileNode.FileName)
+		extraHeaders := map[string]string{
+			"Content-Disposition": `attachment; filename="` + fileName + `"`,
+			"Accept-Ranges":       "bytes",
+			"Content-Range":       fmt.Sprintf("bytes %d-%d/%d", 0, fileNode.FileSize-1, fileNode.FileSize),
+		}
+		c.DataFromReader(statusCode, fileNode.FileSize,
+			util.GetMimeTypeByExt(fileNode.FileType), r, extraHeaders)
+	}
+}
+
+func WebDavDownload(ac module.Account, downUrl string, fileNode module.FileNode, c *gin.Context) {
+	p, _ := base.GetPan(ac.Mode)
+	statusCode := http.StatusOK
+	if c.GetHeader("Range") != "" {
+		statusCode = http.StatusPartialContent
+	}
+	r, err := p.(*webdav.WebDav).ReadFileReader(ac, downUrl, 0, fileNode.FileSize)
+	defer r.Close()
+	if err == nil {
+		fileName := url.QueryEscape(fileNode.FileName)
+		extraHeaders := map[string]string{
+			"Content-Disposition": `attachment; filename="` + fileName + `"`,
+			"Accept-Ranges":       "bytes",
+			"Content-Range":       fmt.Sprintf("bytes %d-%d/%d", 0, fileNode.FileSize-1, fileNode.FileSize),
+		}
+		c.DataFromReader(statusCode, fileNode.FileSize,
+			util.GetMimeTypeByExt(fileNode.FileType), r, extraHeaders)
+	}
+}
+
+func UploadConfig(config module.Config) string {
+	//common config
+	configItem := util.ConfigToItem(config)
+	for k, v := range configItem {
+		val, ok := v.(string)
+		if ok {
+			dao.DB.Table("config_item").Where("k=?", k).Update("v", val)
+		}
+	}
+	//accounts
+	if len(config.Accounts) > 0 {
+		for _, account := range config.Accounts {
+			ac := module.Account{}
+			err := dao.DB.Table("account").Where("id=?", account.Id).First(&ac).Error
+			if err == gorm.ErrRecordNotFound {
+				//insert
+				dao.DB.Table("account").Create(util.AccountToMap(account))
+			} else {
+				//update
+				dao.DB.Table("account").Where("id=?", account.Id).Updates(util.AccountToMap(account))
+			}
+		}
+	}
+	//bypass
+	if len(config.BypassList) > 0 {
+		for _, bypass := range config.BypassList {
+			dao.SaveBypass(bypass)
+		}
+	}
+	//short_info
+	if len(config.ShareInfoList) > 0 {
+		for _, shareInfo := range config.ShareInfoList {
+			dao.SaveShareInfo(shareInfo)
+		}
+	}
+	//pwd
+	if len(config.PwdFiles) > 0 {
+		for _, pd := range config.PwdFiles {
+			dao.SavePwdFile(pd)
+		}
+	}
+	//hide
+	if len(config.HideFiles) > 0 {
+		for hf, _ := range config.HideFiles {
+			dao.SaveHideFile(hf)
+		}
+	}
+	return "配置导入成功，如有密码修改，请重新登录"
+}
+
+func UploadPwdFile(content string) {
+	content = strings.TrimSpace(content)
+	if content != "" {
+		lines := strings.Split(content, "\n")
+		for _, line := range lines {
+			columns := strings.Split(line, "\t")
+			pwdFile := module.PwdFiles{}
+			if len(columns) > 0 && columns[0] != "" {
+				pwdFile.FilePath = strings.TrimSpace(columns[0])
+				if len(columns) > 1 {
+					pwdFile.Password = strings.TrimRight(columns[1], "\r")
+				} else {
+					pwdFile.Password = util.RandomPassword(8)
+					pwdFile.ExpireAt = 0
+				}
+				if len(columns) > 2 && columns[2] != "" {
+					ex, _ := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimRight(columns[2], "\r"), time.Local)
+					pwdFile.ExpireAt = ex.UTC().Unix()
+				}
+				if len(columns) > 3 && columns[3] != "" {
+					pwdFile.Info = strings.TrimRight(columns[3], "\r")
+				}
+				dao.SavePwdFile(pwdFile)
+				dao.InitGlobalConfig()
+			}
+		}
+	}
+}
+
+func GenShareInfo(urlPrefix, pwdId string) string {
+	//1. pwd
+	pwdFile := module.PwdFiles{}
+	dao.DB.Where("id=?", pwdId).First(&pwdFile)
+	fileName := util.GetFileName(pwdFile.FilePath)
+	//2. share
+	shortUrl, _, _ := ShortInfo(pwdFile.FilePath, urlPrefix)
+	msg := fmt.Sprintf("「%s」%s 密码: %s", fileName, shortUrl, pwdFile.Password)
+	return msg
 }
